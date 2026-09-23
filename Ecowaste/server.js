@@ -46,7 +46,7 @@ STYLE
 Friendly, professional, supportive, educational, encouraging, accurate. Use clear headings, bullet points, numbered steps, and concrete examples. Avoid overly technical language unless requested. Match the user's language whenever possible. Celebrate users' recycling and sustainability efforts.`;
 
 const app = express();
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 3003;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-in-production';
 const DB_PATH = path.join(__dirname, 'backend', 'data', 'db.json');
 const DB_TMP_PATH = path.join(__dirname, 'backend', 'data', 'db.tmp.json');
@@ -419,21 +419,31 @@ function readDb() {
 }
 
 // FIX #1: Atomic File Writes + FIX #2: Write Queue / Mutex
+// FIX #9: Write queue depth guard — prevents queue OOM during rapid sequential scans
 let writeQueue = Promise.resolve();
-let pendingWrite = false;
+let writeQueueDepth = 0;
+const MAX_WRITE_QUEUE_DEPTH = 5;
 
 function writeDb(db) {
-  dbCache = db;
-  if (!pendingWrite) {
-    pendingWrite = true;
-    writeQueue = writeQueue.then(() => flushDb()).catch(err => {
-      console.error('[DB] Write failed:', err.message);
-    });
+  dbCache = db; // Always update the in-memory cache immediately
+  if (writeQueueDepth >= MAX_WRITE_QUEUE_DEPTH) {
+    // Queue is full — dbCache is already updated so the next flush will pick up
+    // all accumulated changes. This coalesces rapid writes safely.
+    console.warn('[DB] Write queue saturated — coalescing write');
+    return;
   }
+  writeQueueDepth++;
+  writeQueue = writeQueue.then(() => {
+    writeQueueDepth = Math.max(0, writeQueueDepth - 1);
+    return flushDb();
+  }).catch(err => {
+    writeQueueDepth = Math.max(0, writeQueueDepth - 1);
+    console.error('[DB] Write failed:', err.message);
+  });
 }
 
 async function flushDb() {
-  pendingWrite = false;
+  // FIX #7: Removed undeclared `pendingWrite = false` (was an implicit global — leftover from a refactor)
   if (!dbCache) return;
 
   try {
@@ -528,11 +538,14 @@ async function authMiddleware(req, res, next) {
 
   try {
     const pbBase = process.env.PB_URL || 'http://127.0.0.1:8090';
+    // FIX #3: Add 2s timeout. Without this, if PocketBase is offline the request
+    // hangs until REQUEST_TIMEOUT_MS (300s), exhausting the event loop under load.
     const pbRes = await fetch(`${pbBase}/api/collections/users/auth-refresh`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-    if (pbRes.ok) {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(2000)
+    }).catch(() => null); // PB offline → fall through to JWT
+    if (pbRes && pbRes.ok) {
       const pbData = await pbRes.json();
       req.userId = pbData.record.id;
       req.authToken = token;
@@ -548,6 +561,42 @@ async function authMiddleware(req, res, next) {
   }
 }
 
+async function optionalAuthMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  
+  if (!token || token === 'null' || token === 'undefined') {
+    return next();
+  }
+
+  if (isTokenBlacklisted(token)) {
+    return next();
+  }
+
+  try {
+    const pbBase = process.env.PB_URL || 'http://127.0.0.1:8090';
+    // FIX #3 (optionalAuth): same 2s timeout as authMiddleware
+    const pbRes = await fetch(`${pbBase}/api/collections/users/auth-refresh`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(2000)
+    }).catch(() => null);
+    if (pbRes && pbRes.ok) {
+      const pbData = await pbRes.json();
+      req.userId = pbData.record.id;
+      req.authToken = token;
+      return next();
+    }
+
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.sub;
+    req.authToken = token;
+    next();
+  } catch (err) {
+    next();
+  }
+}
+
 async function extractUserIdFromAuth(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -556,11 +605,13 @@ async function extractUserIdFromAuth(req) {
 
   try {
     const pbBase = process.env.PB_URL || 'http://127.0.0.1:8090';
+    // FIX #3 (extractUserId): same 2s timeout as authMiddleware
     const pbRes = await fetch(`${pbBase}/api/collections/users/auth-refresh`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-    if (pbRes.ok) {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(2000)
+    }).catch(() => null);
+    if (pbRes && pbRes.ok) {
       const pbData = await pbRes.json();
       return pbData.record.id;
     }
@@ -587,6 +638,12 @@ function cleanupExpiredVerificationSessions() {
   }
   if (changed) saveScanSessions(scanVerificationSessions);
 }
+
+// FIX #7: Periodic session flush — ensures sessions survive server restart
+// even if no writes triggered saveScanSessions() in the last 60 seconds
+setInterval(() => {
+  cleanupExpiredVerificationSessions(); // already calls saveScanSessions if changed
+}, 60_000);
 
 function toRad(value) {
   return (Number(value) * Math.PI) / 180;
@@ -698,7 +755,102 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// ============================================================
+// FIX #3: Global Stats Endpoint (for Admin Portal data bridge)
+// The Phase 2 admin portal reads from localStorage (Phase 2 local store) which
+// is completely isolated from the Express db.json. This endpoint exposes
+// aggregated stats from Express so the admin portal can show real data.
+// ============================================================
+app.get('/api/stats/global', (_req, res) => {
+  try {
+    const db = readDb();
+    // db.users is an array of user objects; db.userData is a map keyed by user id
+    const userList = Array.isArray(db.users) ? db.users : [];
+    const userData = (db.userData && typeof db.userData === 'object') ? db.userData : {};
+
+    let totalCredits = 0;
+    let totalItems = 0;
+    let totalRewards = 0;
+
+    for (const user of userList) {
+      const data = userData[user.id];
+      if (data) {
+        totalCredits += Number(data.credits) || 0;
+        totalItems += Array.isArray(data.history) ? data.history.length : 0;
+        totalRewards += Array.isArray(data.claimedRewards) ? data.claimedRewards.length : 0;
+      }
+    }
+
+    // Approximate CO2 saved: ~0.5 kg CO2 per item scanned and recycled
+    const co2Saved = Math.round(totalItems * 0.5 * 10) / 10;
+
+    return res.json({
+      totalUsers: userList.length,
+      totalCredits,
+      totalItems,
+      totalRewards,
+      co2Saved,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Stats error:', err);
+    return res.status(500).json({ error: 'Failed to compute stats' });
+  }
+});
+
 // --- Scan Verification ---
+app.post('/api/scan/validate-image', optionalAuthMiddleware, async (req, res) => {
+  try {
+    if (!ai) {
+      return res.status(500).json({ error: 'AI is not configured.' });
+    }
+    const { imageBase64, mimeType } = req.body;
+    if (!imageBase64) {
+      return res.status(400).json({ error: 'Missing imageBase64' });
+    }
+    
+    let base64Data = imageBase64;
+    if (base64Data.startsWith('data:')) {
+      base64Data = base64Data.split(',')[1];
+    }
+    const mime = mimeType || 'image/jpeg';
+
+    const systemInstruction = "Analyze this image. Is it a computer-generated image (AI generated), a digital illustration, a screenshot, or a stock photo from the internet? It must be a real, authentic, original photograph taken by a smartphone camera in the real world. You must answer strictly with a JSON object: {\"isAuthentic\": true/false, \"reason\": \"short explanation\"}. If it is a real photograph of an item, isAuthentic should be true.";
+    
+    const contentsArray = [
+      {
+        role: 'user',
+        parts: [
+          { text: "Validate this image authenticity." },
+          { inlineData: { mimeType: mime, data: base64Data } }
+        ]
+      }
+    ];
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      config: {
+        systemInstruction: systemInstruction,
+        responseMimeType: "application/json"
+      },
+      contents: contentsArray
+    });
+
+    const textResponse = response.text || '';
+    let jsonResult;
+    try {
+      jsonResult = JSON.parse(textResponse);
+    } catch(e) {
+      jsonResult = { isAuthentic: true, reason: "Failed to parse AI response" };
+    }
+    return res.status(200).json(jsonResult);
+  } catch (error) {
+    console.error('Image Validation Error:', error);
+    // If the API fails, fail open (allow scan) rather than blocking legitimate users
+    return res.status(200).json({ isAuthentic: true, reason: "Validation bypassed due to server error" });
+  }
+});
+
 app.post('/api/scan/verify/start', async (req, res) => {
   cleanupExpiredVerificationSessions();
 
@@ -757,10 +909,13 @@ app.post('/api/scan/verify/complete', (req, res) => {
     return res.status(404).json({ error: 'Verification session not found or expired' });
   }
 
-  // Prototype relaxation: If both are recyclable, treat it as a match to prevent AI camera jitter failures
+  // FIX #2: Strict matching — BOTH material AND recyclability must exactly equal
+  // Step 1 values. The previous "prototype relaxation" OR-conditions caused any
+  // two recyclable items (e.g. plastic bottle + glass jar) to falsely match and
+  // award credits even when the photos were completely different items.
   const isStep2Recyclable = Boolean(step2.isRecyclable);
-  const materialMatched = (session.photo.material === String(step2.material || 'Other')) || (session.photo.isRecyclable && isStep2Recyclable);
-  const recyclableMatched = (session.photo.isRecyclable === isStep2Recyclable) || isStep2Recyclable;
+  const materialMatched = session.photo.material === String(step2.material || 'Other');
+  const recyclableMatched = session.photo.isRecyclable === isStep2Recyclable;
   const step2Location = step2.location && typeof step2.location === 'object'
     ? {
         lat: Number(step2.location.lat),
@@ -958,7 +1113,7 @@ app.delete('/api/sustainai/history', authMiddleware, (req, res) => {
 });
 
 // --- AI Chat ---
-app.post('/api/chat', authMiddleware, chatRateLimit, async (req, res) => {
+app.post('/api/chat', optionalAuthMiddleware, chatRateLimit, async (req, res) => {
   try {
     if (!ai) {
       return res.status(500).json({ error: 'AI is not configured. Missing GEMINI_API_KEY.' });

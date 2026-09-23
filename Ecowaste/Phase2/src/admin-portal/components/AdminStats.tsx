@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Users, 
   Truck, 
@@ -14,38 +14,92 @@ import {
   TrendingUp,
   Package
 } from 'lucide-react';
-import { getAllAccounts, getAllRequests, type PickupRequest } from '@/lib/requestStore';
+import { getAllAccounts, getAllRequests, subscribeToBroadcast, type PickupRequest } from '@/lib/requestStore';
 import { type AdminTab } from '../PortalEntry';
 
 export default function AdminStats({ onNavigate }: { onNavigate?: (tab: AdminTab) => void }) {
   const [requests, setRequests] = useState<PickupRequest[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
+  // FIX #3: API stats fallback — used when localStorage (Phase 2 local store) is empty
+  const [apiStats, setApiStats] = useState<{ totalUsers: number; totalCredits: number; totalItems: number; totalRewards: number; co2Saved: number } | null>(null);
+  const [apiDataSource, setApiDataSource] = useState(false);
 
   useEffect(() => {
-    setRequests(getAllRequests());
-    setAccounts(getAllAccounts());
+    const refresh = () => {
+      setRequests(getAllRequests());
+      setAccounts(getAllAccounts());
+    };
+    refresh();
+    // FIX #6: subscribeToBroadcast expects (msg: BroadcastMessage) => void, not () => void
+    // Wrap refresh so the message arg is accepted but ignored (we re-read from cache)
+    const unsub = subscribeToBroadcast((_msg) => refresh());
+
+    // FIX #3: If localStorage has no data, fetch from Express backend as fallback
+    // This bridges the gap between Phase 1 (PocketBase/Express) and Phase 2 (localStorage) data
+    const localAccounts = getAllAccounts();
+    const localRequests = getAllRequests();
+    if (localAccounts.length === 0 && localRequests.length === 0) {
+      // Determine API base: on localhost use relative path, on production use the full URL
+      const apiBase = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+        ? '/api'
+        : 'https://ecowaste-node.onrender.com/api';
+
+      fetch(`${apiBase}/stats/global`)
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (data && data.totalUsers != null) {
+            setApiStats(data);
+            setApiDataSource(true);
+          }
+        })
+        .catch(() => { /* API unavailable — silently ignore */ });
+    }
+
+    return () => unsub();
   }, []);
 
-  const usersCount = accounts.filter(a => a.role === 'user').length;
-  const collectorsCount = accounts.filter(a => a.role === 'collector').length;
-  const pendingRequests = requests.filter(r => r.status === 'pending').length;
-  const totalKg = requests.reduce((sum, r) => sum + r.estimatedKg, 0);
+  // FIX #3: Memoize stats — use API fallback when localStorage is empty
+  const usersCount = useMemo(() => {
+    if (accounts.length > 0) return accounts.filter(a => a.role === 'user').length;
+    return apiStats?.totalUsers ?? 0;
+  }, [accounts, apiStats]);
+
+  const collectorsCount = useMemo(() => {
+    if (accounts.length > 0) return accounts.filter(a => a.role === 'collector').length;
+    // Estimate: we don't have collector count from the global API, show 0 if no local data
+    return 0;
+  }, [accounts]);
+
+  const pendingRequests = useMemo(() => {
+    if (requests.length > 0) return requests.filter(r => r.status === 'pending').length;
+    return 0;
+  }, [requests]);
+
+  const totalKg = useMemo(() => {
+    if (requests.length > 0) return requests.reduce((sum, r) => sum + r.estimatedKg, 0);
+    // Use CO2 saved as a proxy for volume when no local requests
+    return apiStats?.co2Saved ?? 0;
+  }, [requests, apiStats]);
+
+  // Show total scanned items from API when available
+  const totalItemsFromApi = apiStats?.totalItems ?? 0;
 
   const wasteTypes = ['Plastic', 'Organic', 'Paper', 'Electronic', 'Metal', 'Glass'];
-  const distribution = wasteTypes.map(type => {
-    const count = requests.filter(r => r.wasteType.toLowerCase().includes(type.toLowerCase())).length;
-    return { label: type, count };
-  });
-  
-  const totalRecs = requests.length || 1;
-  const sortedDistribution = distribution
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 4)
-    .map(item => ({
-      label: item.label,
-      percentage: Math.round((item.count / totalRecs) * 100),
-      color: item.label === 'Plastic' ? 'bg-blue-500' : item.label === 'Organic' ? 'bg-emerald-500' : item.label === 'Paper' ? 'bg-indigo-500' : 'bg-rose-500'
-    }));
+  const sortedDistribution = useMemo(() => {
+    const totalRecs = requests.length || 1;
+    return wasteTypes
+      .map(type => ({
+        label: type,
+        count: requests.filter(r => r.wasteType.toLowerCase().includes(type.toLowerCase())).length
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 4)
+      .map(item => ({
+        label: item.label,
+        percentage: Math.round((item.count / totalRecs) * 100),
+        color: item.label === 'Plastic' ? 'bg-blue-500' : item.label === 'Organic' ? 'bg-emerald-500' : item.label === 'Paper' ? 'bg-indigo-500' : 'bg-rose-500'
+      }));
+  }, [requests]);
 
   return (
     <div className="max-w-[1600px] mx-auto space-y-10 pb-12 animate-in fade-in duration-700">
@@ -54,7 +108,13 @@ export default function AdminStats({ onNavigate }: { onNavigate?: (tab: AdminTab
         <div>
           <div className="flex items-center gap-2 mb-2">
             <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981]" />
-            <span className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400">Live Mission Overvview</span>
+            {/* FIX #3 (minor): Fix typo "Overvview" → "Overview". Show data source badge. */}
+            <span className="text-[10px] font-black uppercase tracking-[0.3em] text-slate-400">Live Mission Overview</span>
+            {apiDataSource && (
+              <span className="ml-3 px-2 py-0.5 bg-blue-50 text-blue-600 text-[9px] font-bold uppercase tracking-wider rounded-full border border-blue-200">
+                Server Data
+              </span>
+            )}
           </div>
           <h1 className="text-3xl font-black text-slate-900 tracking-tight">System Infrastructure</h1>
         </div>
@@ -72,6 +132,7 @@ export default function AdminStats({ onNavigate }: { onNavigate?: (tab: AdminTab
       </div>
 
       {/* SECTION 2: PRIMARY METRICS GRID */}
+      {/* FIX #3: Show API data when available; show total items scanned as 4th metric */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard 
           icon={<Users size={20} />} 
@@ -96,8 +157,8 @@ export default function AdminStats({ onNavigate }: { onNavigate?: (tab: AdminTab
         />
         <StatCard 
           icon={<Zap size={20} />} 
-          label="Recovered Volume" 
-          value={`${totalKg}kg`} 
+          label={apiDataSource ? 'Total Scans' : 'Recovered Volume'} 
+          value={apiDataSource ? totalItemsFromApi : `${totalKg}kg`} 
           trend="+18%" 
         />
       </div>

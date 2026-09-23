@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   ClipboardList, 
   Search, 
@@ -17,7 +17,7 @@ import {
   Activity,
   Trash2
 } from 'lucide-react';
-import { getAllRequests, updateRequestStatus, type PickupRequest, type RequestStatus } from '@/lib/requestStore';
+import { getAllRequests, updateRequestStatus, subscribeToBroadcast, type PickupRequest, type RequestStatus } from '@/lib/requestStore';
 import { toast } from 'sonner';
 import Modal from './Modal';
 
@@ -28,26 +28,21 @@ export default function RequestList() {
   const [selectedRequest, setSelectedRequest] = useState<PickupRequest | null>(null);
 
   useEffect(() => {
-    setRequests(getAllRequests());
-    
-    // Simple polling for real-time updates in this demo
-    const interval = setInterval(() => {
-      setRequests(getAllRequests());
-    }, 5000);
-    
-    return () => clearInterval(interval);
+    const refresh = () => setRequests(getAllRequests());
+    refresh();
+    // BroadcastChannel handles real-time — no polling needed
+    const unsub = subscribeToBroadcast(refresh);
+    return () => unsub();
   }, []);
 
-  const filteredRequests = requests.filter(r => {
+  const filteredRequests = useMemo(() => requests.filter(r => {
     const matchesSearch = 
       r.userName.toLowerCase().includes(searchTerm.toLowerCase()) || 
       r.id.includes(searchTerm) ||
       r.address.toLowerCase().includes(searchTerm.toLowerCase());
-    
     const matchesFilter = statusFilter === 'all' || r.status === statusFilter;
-    
     return matchesSearch && matchesFilter;
-  });
+  }), [requests, searchTerm, statusFilter]);
 
   const getStatusInfo = (status: RequestStatus) => {
     switch (status) {

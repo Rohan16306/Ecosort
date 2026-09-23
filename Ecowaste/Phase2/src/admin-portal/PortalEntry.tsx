@@ -61,7 +61,14 @@ export default function AdminPortalEntry() {
     router.push('/sign-up-login-screen');
   };
 
-  if (!isLoaded) return null;
+  if (!isLoaded) return (
+    <div className="flex h-screen bg-[#F8FAFC] items-center justify-center">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-10 h-10 border-4 border-primary/30 border-t-primary rounded-full animate-spin" />
+        <p className="text-sm text-slate-500 font-medium">Loading Admin Portal...</p>
+      </div>
+    </div>
+  );
 
   return (
     <div className="flex h-screen bg-[#F8FAFC]">

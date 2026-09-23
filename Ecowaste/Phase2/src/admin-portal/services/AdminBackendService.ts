@@ -1,8 +1,6 @@
 'use client';
 
-// ─── ADMIN BACKEND SERVICE ──────────────────────────────────────────────────
-// This service acts as the "Backend" layer for the Admin Portal.
-// It manages the "Separate Database" (System Logs) and Admin-only actions.
+import { readCached, writeCached } from '@/lib/requestStoreCache';
 
 /**
  * LOG TYPES
@@ -27,13 +25,7 @@ export const AdminBackendService = {
    * Fetch all data from the administrative audit table
    */
   getAuditTrail: (): SystemLog[] => {
-    if (typeof window === 'undefined') return [];
-    try {
-      const raw = localStorage.getItem(ADMIN_DB_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
+    return readCached<SystemLog>('wastepickup_admin_audit_trail');
   },
 
   /**
@@ -47,17 +39,12 @@ export const AdminBackendService = {
       id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
       timestamp: new Date().toISOString(),
     };
-    
-    // Database optimization: keep only last 1000 entries
     const updatedHistory = [newEntry, ...history].slice(0, 1000);
-    localStorage.setItem(ADMIN_DB_KEY, JSON.stringify(updatedHistory));
-    
-    // Broadcast to other tabs for real-time reactivity
-    if (typeof window !== 'undefined') {
-       const channel = new BroadcastChannel('admin_realtime_db');
-       channel.postMessage({ type: 'DB_COMMIT', entry: newEntry });
-       channel.close();
-    }
+    writeCached('wastepickup_admin_audit_trail', updatedHistory);
+    // Dispatch a storage event so other tabs pick up changes via the storageListener below
+    try {
+      window.dispatchEvent(new StorageEvent('storage', { key: ADMIN_DB_KEY }));
+    } catch { /* ignore */ }
   },
 
   /**
@@ -65,7 +52,7 @@ export const AdminBackendService = {
    */
   purgeDatabase: (): void => {
     if (typeof window === 'undefined') return;
-    localStorage.setItem(ADMIN_DB_KEY, JSON.stringify([]));
+    writeCached('wastepickup_admin_audit_trail', []);
   },
 
   /**
@@ -81,12 +68,23 @@ export const AdminBackendService = {
    */
   subscribeToLiveStream: (callback: (entry: SystemLog) => void): (() => void) => {
     if (typeof window === 'undefined') return () => {};
-    const channel = new BroadcastChannel('admin_realtime_db');
-    channel.onmessage = (e) => {
-      if (e.data.type === 'DB_COMMIT') {
-        callback(e.data.entry);
-      }
+    // Listen for storage events fired by logAction (cross-tab) or same-tab writes
+    const handler = () => {
+      const latest = AdminBackendService.getAuditTrail();
+      if (latest.length > 0) callback(latest[0]);
     };
-    return () => channel.close();
-  }
+    window.addEventListener('storage', handler);
+    // Also listen via BroadcastChannel for cross-tab (non-storage-event) updates
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel('admin_realtime_db');
+      channel.onmessage = (e) => {
+        if (e.data.type === 'DB_COMMIT') callback(e.data.entry);
+      };
+    } catch { /* BroadcastChannel not supported */ }
+    return () => {
+      window.removeEventListener('storage', handler);
+      channel?.close();
+    };
+  },
 };

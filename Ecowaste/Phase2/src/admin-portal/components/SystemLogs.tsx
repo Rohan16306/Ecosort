@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Database, Shield, Info, AlertTriangle, CheckCircle, Search, Trash2, Download, RefreshCw } from 'lucide-react';
 import { AdminBackendService, type SystemLog } from '../services/AdminBackendService';
 import { toast } from 'sonner';
@@ -19,11 +19,21 @@ export default function SystemLogs() {
     return () => unsubscribe();
   }, []);
 
-  const filteredLogs = logs.filter(log => 
-    log.action.toLowerCase().includes(searchTerm.toLowerCase()) || 
-    log.performedBy.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    JSON.stringify(log.details).toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const filteredLogs = useMemo(() => {
+    if (!searchTerm) return logs;
+    const term = searchTerm.toLowerCase();
+    return logs.filter(log => {
+      // Pre-stringify details once per log, not per character typed
+      const detailStr = typeof log.details === 'string'
+        ? log.details
+        : JSON.stringify(log.details);
+      return (
+        log.action.toLowerCase().includes(term) ||
+        log.performedBy.toLowerCase().includes(term) ||
+        detailStr.toLowerCase().includes(term)
+      );
+    });
+  }, [logs, searchTerm]);
 
   const getLogStyle = (type: SystemLog['type']) => {
     switch (type) {

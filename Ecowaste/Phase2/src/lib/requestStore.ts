@@ -2,6 +2,7 @@
 
 // Real-time pickup request store using localStorage + BroadcastChannel
 // This acts as the shared state layer between user and collector interfaces
+import { readCached, writeCached, invalidateCache } from './requestStoreCache';
 
 export type RequestStatus =
   | 'pending' |'accepted' |'on-the-way' |'arrived' |'collected' |'completed' |'rejected';
@@ -60,20 +61,14 @@ export interface RegisteredAccount {
 const ACCOUNTS_KEY = 'wastepickup_accounts';
 
 export function getAllAccounts(): RegisteredAccount[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(ACCOUNTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  return readCached<RegisteredAccount>('wastepickup_accounts');
 }
 
 export function registerAccount(account: RegisteredAccount): void {
   if (typeof window === 'undefined') return;
   const all = getAllAccounts();
   all.push(account);
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(all));
+  writeCached('wastepickup_accounts', all);
 
   addSystemLog({
     action: 'ACCOUNT_REGISTERED',
@@ -99,7 +94,7 @@ export function deleteAccount(id: string): void {
   if (!account) return;
 
   const updated = all.filter((a) => a.id !== id);
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(updated));
+  writeCached('wastepickup_accounts', updated);
 
   addSystemLog({
     action: 'ACCOUNT_DELETED',
@@ -116,7 +111,7 @@ export function updateAccount(id: string, updates: Partial<RegisteredAccount>): 
   if (idx < 0) return;
 
   all[idx] = { ...all[idx], ...updates };
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(all));
+  writeCached('wastepickup_accounts', all);
 
   addSystemLog({
     action: 'ACCOUNT_UPDATED',
@@ -131,7 +126,6 @@ export function initializeAdminAccount(): void {
   const adminEmail = 'patilom162006@gmail.com';
   const adminPass = 'Patilom@123';
   
-  // Clean up any old admin accounts if they exist (to ensure ONLY one)
   const all = getAllAccounts();
   const filtered = all.filter(a => !(a.role === 'admin' && a.email !== adminEmail));
   
@@ -145,8 +139,7 @@ export function initializeAdminAccount(): void {
       phone: '+91 00000 00000',
       createdAt: new Date().toISOString(),
     });
-    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(filtered));
-    
+    writeCached('wastepickup_accounts', filtered);
     addSystemLog({
       action: 'ADMIN_INITIALIZED',
       performedBy: 'SYSTEM',
@@ -154,25 +147,19 @@ export function initializeAdminAccount(): void {
       type: 'success',
     });
   } else if (all.length !== filtered.length) {
-    // If we filtered out old admins, save the cleaned list
-    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(filtered));
+    writeCached('wastepickup_accounts', filtered);
   }
 }
 
-// Internal admin log proxy to decouple if admin portal exists
+// Internal admin log — writes directly to cache + localStorage.
+// PERF: Previously created a BroadcastChannel on every write (very slow).
+// Now we write directly and let the existing broadcast in broadcastUpdate() handle cross-tab sync.
 function addSystemLog(log: any) {
-  if (typeof window !== 'undefined') {
-    // We import the backend service dynamically or use a broadcast
-    const channel = new BroadcastChannel('admin_realtime_db');
-    channel.postMessage({ type: 'DB_COMMIT', entry: { ...log, id: `log-${Date.now()}`, timestamp: new Date().toISOString() } });
-    channel.close();
-    
-    // Also save to the admin DB key directly to ensuring persistence even if portal isn't open
-    const ADMIN_DB_KEY = 'wastepickup_admin_audit_trail';
-    const history = JSON.parse(localStorage.getItem(ADMIN_DB_KEY) || '[]');
-    history.unshift({ ...log, id: `log-${Date.now()}`, timestamp: new Date().toISOString() });
-    localStorage.setItem(ADMIN_DB_KEY, JSON.stringify(history.slice(0, 1000)));
-  }
+  if (typeof window === 'undefined') return;
+  const entry = { ...log, id: `log-${Date.now()}`, timestamp: new Date().toISOString() };
+  const history = readCached<any>('wastepickup_admin_audit_trail');
+  const updated = [entry, ...history].slice(0, 1000);
+  writeCached('wastepickup_admin_audit_trail', updated);
 }
 
 // ─── Notification Store ───────────────────────────────────────────────────────
@@ -190,24 +177,17 @@ export interface AppNotification {
 const NOTIFICATIONS_KEY = 'wastepickup_notifications';
 
 export function getNotifications(requestId?: string): AppNotification[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(NOTIFICATIONS_KEY);
-    const all: AppNotification[] = raw ? JSON.parse(raw) : [];
-    return requestId ? all.filter((n) => n.requestId === requestId) : all;
-  } catch {
-    return [];
-  }
+  const all = readCached<AppNotification>('wastepickup_notifications');
+  return requestId ? all.filter((n) => n.requestId === requestId) : all;
 }
 
 export function addNotification(notif: AppNotification): void {
   if (typeof window === 'undefined') return;
   const all = getNotifications();
-  // Avoid duplicate notifications for same request+type
   const exists = all.some((n) => n.requestId === notif.requestId && n.type === notif.type);
   if (exists) return;
-  all.unshift(notif);
-  localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(all));
+  const updated = [notif, ...all];
+  writeCached('wastepickup_notifications', updated);
   broadcastUpdate({ type: 'NOTIFICATION_ADDED', notification: notif });
 }
 
@@ -215,7 +195,7 @@ export function markNotificationsRead(requestId: string): void {
   if (typeof window === 'undefined') return;
   const all = getNotifications();
   const updated = all.map((n) => (n.requestId === requestId ? { ...n, read: true } : n));
-  localStorage.setItem(NOTIFICATIONS_KEY, JSON.stringify(updated));
+  writeCached('wastepickup_notifications', updated);
 }
 
 // ─── Request CRUD ────────────────────────────────────────────────────────────
@@ -225,13 +205,7 @@ const COLLECTOR_SESSION_KEY = 'wastepickup_collector_session';
 const BROADCAST_CHANNEL = 'wastepickup_realtime';
 
 export function getAllRequests(): PickupRequest[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(REQUESTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  return readCached<PickupRequest>('wastepickup_requests');
 }
 
 export function saveRequest(req: PickupRequest): void {
@@ -243,15 +217,15 @@ export function saveRequest(req: PickupRequest): void {
   } else {
     all.unshift(req);
   }
-  localStorage.setItem(REQUESTS_KEY, JSON.stringify(all));
+  writeCached('wastepickup_requests', all);
   broadcastUpdate({ type: 'REQUEST_UPDATED', request: req });
 }
 
 export function addRequest(req: PickupRequest): void {
   if (typeof window === 'undefined') return;
   const all = getAllRequests();
-  all.unshift(req);
-  localStorage.setItem(REQUESTS_KEY, JSON.stringify(all));
+  const updated = [req, ...all];
+  writeCached('wastepickup_requests', updated);
   broadcastUpdate({ type: 'REQUEST_ADDED', request: req });
   
   addSystemLog({
@@ -282,7 +256,7 @@ export function updateRequestStatus(
   const idx = all.findIndex((r) => r.id === id);
   if (idx < 0) return null;
   all[idx] = { ...all[idx], status, ...collectorInfo };
-  localStorage.setItem(REQUESTS_KEY, JSON.stringify(all));
+  writeCached('wastepickup_requests', all);
   broadcastUpdate({ type: 'STATUS_CHANGED', request: all[idx] });
 
   addSystemLog({
@@ -335,7 +309,7 @@ export function updateRequestStatus(
     const collectorCredits = Math.floor(Math.random() * (25 - 15 + 1)) + 15;
     all[idx].creditsAwarded = userCredits;
     all[idx].collectorCreditsAwarded = collectorCredits;
-    localStorage.setItem(REQUESTS_KEY, JSON.stringify(all));
+    writeCached('wastepickup_requests', all);
 
     // Notify user of credits
     addNotification({
@@ -694,18 +668,12 @@ export function claimReward(userId: string, rewardId: string): boolean {
     claimedAt: new Date().toISOString(),
   };
   claimed.push(newClaim);
-  localStorage.setItem(CLAIMED_REWARDS_KEY, JSON.stringify(claimed));
+  writeCached('wastepickup_claimed_rewards', claimed);
   broadcastUpdate({ type: 'REQUEST_UPDATED', request: {} as PickupRequest }); // trigger refresh
   return true;
 }
 
 export function getUserClaimedRewards(userId: string): ClaimedReward[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(CLAIMED_REWARDS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  return readCached<ClaimedReward>('wastepickup_claimed_rewards');
 }
 

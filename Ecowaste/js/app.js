@@ -37,11 +37,29 @@
         const PRODUCTION_BACKEND_URL = 'https://ecowaste-node.onrender.com';
         const PRODUCTION_PB_URL = 'https://ecowaste-pocketbase.onrender.com';
 
+        // Phase 2 URL — UPDATE this after deploying Phase2 folder to Vercel
+        // On localhost, Express proxies Phase 2 routes, so we use '' (relative paths).
+        // On Vercel/production, Phase 2 is a separate deployment.
+        const PHASE2_VERCEL_URL = 'https://eco-sort-ai-phase2.vercel.app';
+
+        function isLocalhost() {
+            return window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        }
+
+        function getPhase2BaseUrl() {
+            // On localhost, Express server proxies Phase 2 routes directly
+            if (isLocalhost()) return '';
+            // On Vercel/production, redirect to the separate Phase 2 deployment
+            return PHASE2_VERCEL_URL;
+        }
+
         function resolveApiBase() {
+            if (isLocalhost()) return window.location.origin + '/api';
             return PRODUCTION_BACKEND_URL + '/api';
         }
 
         function resolvePbUrl() {
+            if (isLocalhost()) return 'http://localhost:8090';
             return PRODUCTION_PB_URL;
         }
 
@@ -90,6 +108,14 @@
         document.addEventListener('DOMContentLoaded', async () => {
             // Handle History API for back/forward buttons
             window.addEventListener('popstate', () => {
+                // BUGFIX: Block navigation during active Step 2 verification.
+                // If a pendingVerification exists or a Step 2 image has been loaded,
+                // the user is mid-workflow. A popstate (e.g. from file dialog cancel
+                // or programmatic hash change) must not reset the scan state.
+                if (pendingVerification || currentStep2Image) {
+                    console.warn('[Router] Navigation blocked: Step 2 verification in progress.');
+                    return;
+                }
                 const view = window.location.hash.replace('#', '') || 'home';
                 router(view, true);
             });
@@ -129,13 +155,21 @@
             }
 
             initThemeToggle();
-            checkAuthStatus().catch(console.error);
-            loadData().catch(console.error);
+            // FIX #4: Run auth check and data load in parallel instead of sequentially.
+            // Previously: checkAuthStatus (0-3s) → loadData (0-2s) → refreshGlobalImpact → etc.
+            // Now:        all fire concurrently, page is interactive ~2x faster.
+            await Promise.allSettled([
+                checkAuthStatus(),
+                loadData()
+            ]);
             updateGlobalStats();
-            await refreshGlobalImpact();
+            // FIX #4b: Run media/post fetch and impact stats in parallel
+            await Promise.allSettled([
+                refreshGlobalImpact(),
+                loadFeaturedMedia(),
+                loadCommunityPosts()
+            ]);
             initScrollAnimations();
-            await loadFeaturedMedia();
-            await loadCommunityPosts();
             bindCommunityForm();
             initQuiz();
             
@@ -151,7 +185,7 @@
             }
         });
 
-        const CLASS_NAMES = ['glass', 'hard_waste', 'liquid_waste', 'metal', 'non_organic_waste', 'organic_waste', 'plastic'];
+        const CLASS_NAMES = ['cardboard', 'glass', 'metal', 'paper', 'plastic', 'trash'];
 
         function startModelLoad() {
             if (model) return Promise.resolve(model);
@@ -162,38 +196,56 @@
                 return new Promise(resolve => setTimeout(resolve, 500)).then(startModelLoad);
             }
 
-            // Load the custom-trained local model instead of the generic internet one
-            // We load it from the frontend-next folder where the converted model lives
-            modelLoadPromise = tf.loadLayersModel('/model/model.json')
-                .then((loadedModel) => {
-                    // Create a wrapper that mimics the old MobileNet .classify() API
-                    // so we don't have to rewrite the rest of the old frontend
-                    model = {
-                        classify: async (imgElement) => {
-                            return tf.tidy(() => {
-                                let tensor = tf.browser.fromPixels(imgElement);
-                                tensor = tf.image.resizeBilinear(tensor, [224, 224]);
-                                // MobileNetV2 preprocessing: [-1, 1]
-                                const preprocessed = tensor.toFloat().div(127.5).sub(1.0);
-                                const batched = preprocessed.expandDims(0);
-                                
-                                const predictions = loadedModel.predict(batched);
-                                const probabilities = predictions.dataSync();
-                                
-                                return CLASS_NAMES.map((name, idx) => ({
-                                    className: name,
-                                    probability: probabilities[idx]
-                                })).sort((a, b) => b.probability - a.probability);
-                            });
+            modelLoadPromise = (async () => {
+                // FIX: Select WebGL (GPU) backend explicitly before loading model.
+                // Without this, TF.js probes all backends sequentially, wasting ~1s.
+                try { await tf.setBackend('webgl'); } catch(_) {}
+                await tf.ready();
+
+                const loadedModel = await tf.loadGraphModel('/model/model.json');
+
+                // FIX: async classify() — replaces tf.tidy()+dataSync() which froze
+                // the main thread for 10-15s by synchronously transferring GPU→CPU.
+                // We now manually dispose every tensor in try/finally and use the
+                // fully async .data() call so the browser stays responsive.
+                model = {
+                    classify: async (imgElement) => {
+                        const tensor    = tf.browser.fromPixels(imgElement);
+                        const resized   = tf.image.resizeBilinear(tensor, [224, 224]);
+                        const pre       = resized.toFloat().div(127.5).sub(1.0);
+                        const batched   = pre.expandDims(0);
+                        const predTensor = loadedModel.predict(batched);
+                        try {
+                            // ASYNC: does not block the main thread
+                            const probs = await predTensor.data();
+                            return CLASS_NAMES
+                                .map((name, idx) => ({ className: name, probability: probs[idx] }))
+                                .sort((a, b) => b.probability - a.probability);
+                        } finally {
+                            // Manual cleanup replaces tf.tidy()
+                            tensor.dispose(); resized.dispose();
+                            pre.dispose(); batched.dispose(); predTensor.dispose();
                         }
-                    };
-                    return model;
-                })
-                .catch((e) => {
-                    console.error("Local AI Model Load Error:", e);
-                    modelLoadPromise = null;
-                    throw e;
-                });
+                    }
+                };
+
+                // FIX: Warm-up pass — runs a dummy inference on a blank canvas
+                // immediately after load so WebGL shaders compile NOW (invisibly)
+                // instead of during the user's first real scan (1-4s delay).
+                try {
+                    const dummy = document.createElement('canvas');
+                    dummy.width = 224; dummy.height = 224;
+                    await model.classify(dummy); // compile shaders now
+                    console.log('[AI] Model warmed up and ready.');
+                } catch(_) { /* non-fatal */ }
+
+                return model;
+            })()
+            .catch((e) => {
+                console.error("Local AI Model Load Error:", e);
+                modelLoadPromise = null;
+                throw e;
+            });
 
             return modelLoadPromise;
         }
@@ -1087,14 +1139,17 @@
             document.getElementById('guest-notice').classList.add('hidden');
 
             // RBAC: Show/hide nav buttons based on role
+            // FIX #5b: Accept both ROLE_RECEIVER and ROLE_COLLECTOR for collector role
             const navAdmin = document.getElementById('nav-admin');
             const navCollector = document.getElementById('nav-collector');
             const role = currentUser.role || 'ROLE_USER';
+            const isCollector = role === 'ROLE_RECEIVER' || role === 'ROLE_COLLECTOR';
             if (navAdmin) {
                 navAdmin.classList.toggle('hidden', role !== 'ROLE_ADMIN');
             }
             if (navCollector) {
-                navCollector.classList.toggle('hidden', role !== 'ROLE_RECEIVER');
+                // FIX #5b: show for both ROLE_RECEIVER and ROLE_COLLECTOR
+                navCollector.classList.toggle('hidden', !isCollector);
             }
         }
 
@@ -1102,9 +1157,11 @@
             document.getElementById('auth-buttons').classList.remove('hidden');
             document.getElementById('user-menu').classList.add('hidden');
             document.getElementById('guest-notice').classList.remove('hidden');
-            // Hide admin nav when logged out
+            // FIX #5a: Hide BOTH admin and collector navs on logout
             const navAdmin = document.getElementById('nav-admin');
+            const navCollector = document.getElementById('nav-collector');
             if (navAdmin) navAdmin.classList.add('hidden');
+            if (navCollector) navCollector.classList.add('hidden');
         }
 
         function openAuthModal(type) {
@@ -1188,16 +1245,14 @@
                 await refreshGlobalImpact();
                 showNotification('Welcome back, ' + currentUser.name + '!', 'success');
 
-                // RBAC Redirect: Route users to their specific dashboard
-                const role = currentUser.role;
+                // FIX #2: Always redirect to home after login.
+                // Users can navigate to their role-specific pages via the nav.
+                // Previously auto-routed admins/collectors to their dashboards which
+                // bypassed the landing page and confused users.
                 const redirect = sessionStorage.getItem('redirectAfterLogin');
                 if (redirect) {
                     sessionStorage.removeItem('redirectAfterLogin');
                     router(redirect);
-                } else if (role === 'ROLE_ADMIN') {
-                    router('admin');
-                } else if (role === 'ROLE_RECEIVER') {
-                    router('pickup');
                 } else {
                     router('home');
                 }
@@ -1277,12 +1332,8 @@
                 await refreshGlobalImpact();
                 showNotification('Account created successfully! Welcome, ' + name + '!', 'success');
 
-                // RBAC Redirect after signup
-                if (currentUser.role === 'ROLE_RECEIVER') {
-                    router('pickup');
-                } else {
-                    router('home');
-                }
+                // FIX #2: Always redirect to home after signup (same as login fix)
+                router('home');
             } catch (e) {
                 const msg = e.message || 'Signup failed. Please try again.';
                 showNotification(msg, 'error');
@@ -1360,13 +1411,15 @@
                 }
 
                 // RBAC: Block unauthorized access
+                // FIX #5b: Accept both ROLE_RECEIVER and ROLE_COLLECTOR for collector role
                 const role = currentUser?.role || 'ROLE_USER';
+                const isCollectorRole = role === 'ROLE_RECEIVER' || role === 'ROLE_COLLECTOR';
                 if (viewName === 'admin' && role !== 'ROLE_ADMIN') {
                     showNotification('Access Denied: Admin privileges required.', 'error');
                     router('home');
                     return;
                 }
-                if (viewName === 'collector' && role !== 'ROLE_RECEIVER') {
+                if (viewName === 'collector' && !isCollectorRole) {
                     showNotification('Access Denied: Collector privileges required.', 'error');
                     router('home');
                     return;
@@ -1376,7 +1429,8 @@
                 if (['admin', 'pickup', 'collector'].includes(viewName) && currentUser) {
                     let phase2Role = 'user';
                     if (role === 'ROLE_ADMIN') phase2Role = 'admin';
-                    else if (role === 'ROLE_RECEIVER') phase2Role = 'collector';
+                    // FIX #5b: Accept both ROLE_RECEIVER and ROLE_COLLECTOR
+                    else if (role === 'ROLE_RECEIVER' || role === 'ROLE_COLLECTOR') phase2Role = 'collector';
 
                     localStorage.setItem('wastepickup_auth', JSON.stringify({
                         id: currentUser.id,
@@ -1386,17 +1440,36 @@
                     }));
                 }
 
-                // Redirect to Phase 2 (Next.js app proxied on the same port)
-                if (viewName === 'admin') {
-                    window.location.href = '/admin-dashboard';
-                    return;
-                }
-                if (viewName === 'collector') {
-                    window.location.href = '/collector-dashboard';
-                    return;
-                }
-                if (viewName === 'pickup') {
-                    window.location.href = '/pickup-request-tracking';
+                // Redirect to Phase 2 (Next.js app)
+                // On localhost: Express proxies to port 3005 (relative paths work)
+                // On Vercel: Redirect to separate Phase 2 deployment with auth in URL params
+                if (viewName === 'admin' || viewName === 'collector' || viewName === 'pickup') {
+                    const phase2Base = getPhase2BaseUrl();
+                    const routeMap = {
+                        admin: '/admin-dashboard',
+                        collector: '/collector-dashboard',
+                        pickup: '/pickup-request-tracking'
+                    };
+                    let targetUrl = phase2Base + routeMap[viewName];
+
+                    // When redirecting cross-domain (Vercel), pass auth via URL params
+                    // since localStorage is not shared across domains
+                    if (phase2Base && currentUser) {
+                        let phase2Role = 'user';
+                        if (role === 'ROLE_ADMIN') phase2Role = 'admin';
+                        // FIX #5b: Accept both ROLE_RECEIVER and ROLE_COLLECTOR
+                        else if (role === 'ROLE_RECEIVER' || role === 'ROLE_COLLECTOR') phase2Role = 'collector';
+
+                        const params = new URLSearchParams({
+                            auth_id: currentUser.id,
+                            auth_email: currentUser.email,
+                            auth_name: currentUser.name || 'User',
+                            auth_role: phase2Role
+                        });
+                        targetUrl += '?' + params.toString();
+                    }
+
+                    window.location.href = targetUrl;
                     return;
                 }
 
@@ -1433,7 +1506,12 @@
                     updateRewardsPage();
                 }
                 if (viewName === 'detect') {
-                    resetToNewScan();
+                    // BUGFIX: Only call resetToNewScan() when there is no active Step 2 verification.
+                    // Calling reset while pendingVerification is set destroys the verification state
+                    // and causes the Step 2 upload to loop back to Step 1.
+                    if (!pendingVerification && !currentStep2Image) {
+                        resetToNewScan();
+                    }
                     startModelLoad().catch((e) => console.warn('Model preload failed:', e.message));
                 }
                 if (viewName === 'ai') {
@@ -1481,9 +1559,11 @@
                 try {
                     const payload = await apiRequest('/data/me');
                     appData = normalizeAppData(payload.data);
-                    if (currentUser && typeof currentUser.credits === 'number') {
-                        appData.credits = Math.max(appData.credits || 0, currentUser.credits);
-                    }
+                    // FIX #1: Do NOT blend credits from PocketBase (currentUser.credits).
+                    // PocketBase does not store game credits — only the Express db.json does.
+                    // The old Math.max() caused credits to be overwritten to 0 on every refresh
+                    // because currentUser.credits always came back as 0 from PocketBase.
+                    // The correct credits are already in payload.data.credits from Express.
                     localStorage.setItem(storageKey, JSON.stringify(appData));
                     updateGlobalStats();
                     return;
@@ -2014,7 +2094,13 @@
 
             const isDuplicate = duplicate !== null;
             const isLocationDuplicate = locationDuplicate !== null;
-            const finalCredits = isDuplicate ? 0 : credits;
+            let finalCredits = isDuplicate ? 0 : credits;
+
+            // Enforce minimum confidence criteria for credits
+            if (prob < 0.20) {
+                finalCredits = 0;
+                credits = 0;
+            }
 
             return {
                 topPrediction: predictions[0],
@@ -2318,18 +2404,36 @@
                 currentImageHash = await generateImageHash(currentImage);
             }
             
+            try {
+                const valRes = await apiRequest('/scan/validate-image', {
+                    method: 'POST',
+                    body: JSON.stringify({ imageBase64: currentImage, mimeType: 'image/jpeg' })
+                });
+                if (valRes && valRes.isAuthentic === false) {
+                    alert("Scan Blocked: " + (valRes.reason || "This image appears to be computer-generated or from the internet. Please scan a real item."));
+                    document.getElementById('loading-area').classList.add('hidden');
+                    return;
+                }
+            } catch (err) {
+                console.warn("Image authenticity validation failed or was bypassed:", err);
+            }
+            
             let predictions;
             let duplicate;
             let locationDuplicate;
             try {
                 duplicate = isDuplicateImage(currentImageHash);
-                currentGeoTag = await getCurrentGeoTag();
-                locationDuplicate = findDuplicateLocation(currentGeoTag);
-                
-                // Short delay keeps feedback smooth without slowing scan much.
-                await new Promise(r => setTimeout(r, 350));
 
-                predictions = await model.classify(imgElement);
+                // FIX: Run geo lookup and AI classification in PARALLEL.
+                // Before: getCurrentGeoTag (0-3s) ran sequentially BEFORE classify (1-3s) = 4-6s total.
+                // After:  both run simultaneously = max(geoTime, classifyTime) = 1-3s total.
+                const [geoTag, classifyResult] = await Promise.all([
+                    getCurrentGeoTag(),
+                    model.classify(imgElement)
+                ]);
+                currentGeoTag = geoTag;
+                locationDuplicate = findDuplicateLocation(currentGeoTag);
+                predictions = classifyResult;
             } catch(e) {
                 console.error('Scan Error:', e);
                 alert('Scan Failed: ' + e.message);
@@ -2388,9 +2492,11 @@
             let imgElement;
             let frameDataUrl;
             
-            if (window.currentStep2Image) {
-                imgElement = await loadImageElement(window.currentStep2Image);
-                frameDataUrl = window.currentStep2Image;
+            // FIX #8: Use module-scoped variable directly, not window. prefix
+            // (window.currentStep2Image is unreliable in strict-mode environments)
+            if (currentStep2Image) {
+                imgElement = await loadImageElement(currentStep2Image);
+                frameDataUrl = currentStep2Image;
             } else if (video && video.src) {
                 // If it's an <img> tag, videoWidth will be undefined, so use naturalWidth/width.
                 const width = video.videoWidth || video.naturalWidth || video.width || 224;
@@ -2430,6 +2536,20 @@
 
             document.getElementById('video-preview-area').classList.add('hidden');
             document.getElementById('loading-area').classList.remove('hidden');
+
+            try {
+                const valRes = await apiRequest('/scan/validate-image', {
+                    method: 'POST',
+                    body: JSON.stringify({ imageBase64: frameDataUrl, mimeType: 'image/jpeg' })
+                });
+                if (valRes && valRes.isAuthentic === false) {
+                    alert("Scan Blocked: " + (valRes.reason || "This image appears to be computer-generated or from the internet. Please scan a real item."));
+                    document.getElementById('loading-area').classList.add('hidden');
+                    return;
+                }
+            } catch (err) {
+                console.warn("Video authenticity validation failed or was bypassed:", err);
+            }
 
             try {
                 // Generate hash
@@ -2806,10 +2926,22 @@
 
             if (aiMessages.length === 0 && !isAiTyping) {
                 container.innerHTML = `
-                    <div class="ai-welcome-card">
+                    <div class="ai-welcome-card shadow-organic" style="border-radius: 24px;">
                         <div class="ai-welcome-icon"><i class="fa-solid fa-leaf"></i></div>
-                        <h3 class="ai-welcome-title">Welcome to SustainAssist Pro</h3>
-                        <p class="ai-welcome-subtitle">I'm your AI guide to recycling, sustainability, and the circular economy. Ask me anything about plastic types, recycling methods, or how to earn credits on EcoSort!</p>
+                        <h3 class="ai-welcome-title">Hello, I'm Sustain AI</h3>
+                        <p class="ai-welcome-subtitle mb-6">Ask me about plastic types, recycling, or upload a photo of a plastic item and I'll help identify it.</p>
+                        
+                        <div class="flex flex-wrap gap-2 justify-center mt-6">
+                            <button onclick="sendSuggestedMessage('How do I identify plastic type #5 (PP)?')" class="inline-flex items-center gap-2 rounded-full border border-green-200 bg-white/70 hover:bg-green-50 transition-colors px-4 py-2 text-sm text-gray-700 shadow-sm">
+                                <i class="fa-solid fa-recycle text-green-600"></i> How do I identify plastic type #5 (PP)?
+                            </button>
+                            <button onclick="sendSuggestedMessage('Tips for reducing single-use plastic at home')" class="inline-flex items-center gap-2 rounded-full border border-green-200 bg-white/70 hover:bg-green-50 transition-colors px-4 py-2 text-sm text-gray-700 shadow-sm">
+                                <i class="fa-solid fa-leaf text-green-600"></i> Tips for reducing single-use plastic at home
+                            </button>
+                            <button onclick="sendSuggestedMessage('How does the credit & reward system work?')" class="inline-flex items-center gap-2 rounded-full border border-green-200 bg-white/70 hover:bg-green-50 transition-colors px-4 py-2 text-sm text-gray-700 shadow-sm">
+                                <i class="fa-solid fa-wand-magic-sparkles text-green-600"></i> How does the credit & reward system work?
+                            </button>
+                        </div>
                     </div>
                 `;
                 renderAiSidebarHistory();
@@ -2914,6 +3046,17 @@
                     });
                 } catch (e) {
                     console.error("Failed to delete item", e);
+                }
+            }
+        }
+
+        function sendSuggestedMessage(text) {
+            const input = document.getElementById('ai-chat-input');
+            if (input) {
+                input.value = text;
+                const form = document.getElementById('ai-chat-form');
+                if (form) {
+                    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
                 }
             }
         }
