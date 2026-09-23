@@ -33,8 +33,8 @@
         let currentUser = null;
         let authToken = null;
         // --- CONFIGURATION ---
-        // UPDATE THIS URL after you deploy your backend to Render!
-        const PRODUCTION_BACKEND_URL = 'https://ecowaste-node.onrender.com';
+        // Backend URL deployed on Railway
+        const PRODUCTION_BACKEND_URL = 'https://ecosort-production-b53a.up.railway.app';
         const PRODUCTION_PB_URL = 'https://ecowaste-pocketbase.onrender.com';
 
         // Phase 2 URL — UPDATE this after deploying Phase2 folder to Vercel
